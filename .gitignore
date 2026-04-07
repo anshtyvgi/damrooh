@@ -1,0 +1,19 @@
+# dependencies
+app/node_modules
+node_modules
+
+# next.js
+app/.next/
+app/out/
+
+# production
+app/build
+
+# misc
+.DS_Store
+*.pem
+.env*
+!.env.example
+
+# debug
+npm-debug.log*

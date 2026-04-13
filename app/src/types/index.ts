@@ -162,3 +162,153 @@ export const LANGUAGES: { value: Language; label: string }[] = [
   { value: "hinglish", label: "Hinglish" },
   { value: "punjabi", label: "Punjabi" },
 ];
+
+// ========================
+// Multi-Model System Types
+// ========================
+
+/** Supported AI music generation models */
+export type MusicModel = "ace-1.5" | "lyria" | "elevenlabs";
+
+/** How the model was chosen */
+export type ModelMode = "auto" | "manual";
+
+/** Which platform feature is being used */
+export type GenerationMode = "dedicate" | "studio" | "sfx";
+
+/** Model routing decision with explanation */
+export interface ModelSelection {
+  model: MusicModel;
+  mode: ModelMode;
+  reason: string;
+}
+
+// ========================
+// Session System
+// ========================
+
+export type SessionStatus =
+  | "queued"
+  | "lyrics"
+  | "generating"
+  | "covers"
+  | "completed"
+  | "partial"
+  | "failed";
+
+/** One lyric variation produced by Gemini */
+export interface LyricVariation {
+  id: string;
+  title: string;
+  vibe: string;
+  lyrics: string;
+  tags: string[];
+}
+
+/** Per-track state within a generation session */
+export interface SessionTrack {
+  id: string;
+  variationIndex: number;
+  lyric: LyricVariation;
+  model: MusicModel;
+  status: "pending" | "generating" | "completed" | "failed";
+  audioUrl?: string;
+  coverUrl?: string;
+  duration?: number;
+  modelTaskId?: string;
+  error?: string;
+}
+
+/** Full generation session (new system — replaces legacy Generation) */
+export interface GenerationSession {
+  id: string;
+  userId?: string;
+  mode: GenerationMode;
+  status: SessionStatus;
+  progress: number; // 0–100
+  modelSelection: ModelSelection;
+  input: Record<string, unknown>;
+  lyrics?: LyricVariation[];
+  tracks: SessionTrack[];
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ========================
+// Studio Mode
+// ========================
+
+export interface StudioInput {
+  prompt: string;
+  style?: string;
+  bpm?: number;
+  key?: string;
+  duration?: number; // seconds, default 60
+  isPublic: boolean;
+  modelMode: ModelMode;
+  model?: MusicModel;
+}
+
+// ========================
+// SFX / Background Mode
+// ========================
+
+export type SFXCategory =
+  | "ambient"
+  | "nature"
+  | "urban"
+  | "cinematic"
+  | "game"
+  | "custom";
+
+export interface SFXInput {
+  description: string;
+  duration?: number; // seconds, default 30
+  loopable: boolean;
+  category: SFXCategory;
+  modelMode: ModelMode;
+  model?: MusicModel;
+}
+
+// ========================
+// Health / Status
+// ========================
+
+export type ServiceHealth = "ok" | "error" | "not_configured" | "degraded";
+
+export interface ServiceStatus {
+  status: ServiceHealth;
+  message: string;
+  latencyMs?: number;
+}
+
+export interface SystemStatus {
+  timestamp: string;
+  overall: ServiceHealth;
+  services: {
+    db: ServiceStatus;
+    redis: ServiceStatus;
+    queue: ServiceStatus;
+    gemini: ServiceStatus;
+    ace: ServiceStatus;
+    lyria: ServiceStatus;
+    elevenlabs: ServiceStatus;
+  };
+}
+
+// ========================
+// Queue
+// ========================
+
+export type JobStatus = "queued" | "running" | "done" | "failed";
+
+export interface QueueJob {
+  id: string;
+  sessionId: string;
+  status: JobStatus;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  error?: string;
+}

@@ -1,147 +1,192 @@
-import { NextRequest, NextResponse } from "next/server";
+/**
+ * GET /api/status
+ *
+ * Full system health check. Checks all services in parallel and returns
+ * a unified status object.
+ *
+ * Checked services:
+ *   db          — in-memory DB (always ok in dev; swap with real DB check)
+ *   redis       — not yet configured (reports not_configured)
+ *   queue       — in-memory job queue stats
+ *   gemini      — Google Gemini API reachability
+ *   ace         — Wavespeed ACE 1.5 reachability
+ *   lyria       — Google Lyria availability
+ *   elevenlabs  — ElevenLabs API authentication
+ *
+ * Query params:
+ *   ?id=<generationId>   — legacy: poll a specific generation (backward compat)
+ */
 
-const ACE_API_KEY = process.env.ACE_API_KEY!;
+import { NextRequest, NextResponse } from "next/server";
+import { dbHealthCheck, Queue } from "@/lib/db";
+import { geminiHealthCheck } from "@/lib/gemini";
+import { aceHealthCheck } from "@/lib/models/ace";
+import { lyriaHealthCheck } from "@/lib/models/lyria";
+import { elevenLabsHealthCheck } from "@/lib/models/elevenlabs";
+import type { ServiceStatus, ServiceHealth, SystemStatus } from "@/types";
+
+// ─── Legacy poll compatibility ────────────────────────────────────────────────
+
+const ACE_API_KEY = process.env.ACE_API_KEY ?? "";
 const DEV_MODE = process.env.DEV_MODE === "true";
 const ACE_STATUS_URL = "https://api.wavespeed.ai/api/v3/predictions";
 
+// Use the global generationStore declared by /api/generate/route.ts
+// Access via unknown to avoid type-declaration conflicts
+type LegacyStore = Map<
+  string,
+  {
+    id: string;
+    status: string;
+    tags: string[];
+    tracks: {
+      id: string;
+      aceTaskId: string | null;
+      status: string;
+      audioUrl: string | null;
+      lyrics: string;
+      title: string;
+      vibe: string;
+    }[];
+    posterUrl: string | null;
+    createdAt: string;
+  }
+>;
+
+function getLegacyStore(): LegacyStore | undefined {
+  return (global as unknown as { generationStore?: LegacyStore }).generationStore;
+}
+
+// ─── Handler ──────────────────────────────────────────────────────────────────
+
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
-  const generationId = searchParams.get("id");
+  const legacyId = searchParams.get("id");
 
-  if (!generationId) {
-    return NextResponse.json({ error: "Missing generation ID" }, { status: 400 });
+  // ── Legacy: single generation poll ───────────────────────────────────────
+  if (legacyId) {
+    return handleLegacyPoll(legacyId);
   }
 
+  // ── Full system health check ──────────────────────────────────────────────
+  const t0 = Date.now();
+
+  const [gemini, ace, lyria, elevenlabs] = await Promise.all([
+    timed(geminiHealthCheck),
+    timed(aceHealthCheck),
+    timed(lyriaHealthCheck),
+    timed(elevenLabsHealthCheck),
+  ]);
+
+  const dbResult = dbHealthCheck();
+  const queueStats = Queue.stats();
+
+  const db: ServiceStatus = {
+    status: dbResult.status,
+    message: `ok — ${Object.entries(dbResult.stats)
+      .map(([k, v]) => `${k}:${v}`)
+      .join(" ")}`,
+  };
+
+  const redis: ServiceStatus = {
+    status: "not_configured",
+    message: "Redis not configured — using in-memory queue (dev only)",
+  };
+
+  const queue: ServiceStatus = {
+    status: "ok",
+    message: `queued:${queueStats.queued} running:${queueStats.running} done:${queueStats.done} failed:${queueStats.failed}`,
+  };
+
+  const services = {
+    db,
+    redis,
+    queue,
+    gemini: toServiceStatus(gemini),
+    ace: toServiceStatus(ace),
+    lyria: toServiceStatus(lyria),
+    elevenlabs: toServiceStatus(elevenlabs),
+  };
+
+  const statuses = Object.values(services).map((s) => s.status as ServiceHealth);
+  const overall: ServiceHealth = statuses.some((s) => s === "error")
+    ? "error"
+    : statuses.some((s) => s === "not_configured" || s === "degraded")
+    ? "degraded"
+    : "ok";
+
+  const body: SystemStatus = {
+    timestamp: new Date().toISOString(),
+    overall,
+    services,
+  };
+
+  return NextResponse.json(body, {
+    status: overall === "error" ? 503 : 200,
+    headers: { "Cache-Control": "no-store" },
+  });
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+async function timed<T extends { status: string; message: string; latencyMs?: number }>(
+  fn: () => Promise<T>
+): Promise<T & { latencyMs: number }> {
+  const t0 = Date.now();
   try {
-    const state = global.generationStore?.get(generationId);
+    const result = await fn();
+    return { ...result, latencyMs: result.latencyMs ?? Date.now() - t0 };
+  } catch (err) {
+    return {
+      status: "error",
+      message: err instanceof Error ? err.message : String(err),
+      latencyMs: Date.now() - t0,
+    } as T & { latencyMs: number };
+  }
+}
 
-    if (!state) {
-      return NextResponse.json({ error: "Generation not found" }, { status: 404 });
-    }
+function toServiceStatus(r: {
+  status: string;
+  message: string;
+  latencyMs?: number;
+}): ServiceStatus {
+  return {
+    status: r.status as ServiceHealth,
+    message: r.message,
+    latencyMs: r.latencyMs,
+  };
+}
 
-    // If already completed or failed, return cached
-    if (state.status === "completed" || state.status === "failed") {
-      return NextResponse.json({
-        id: state.id,
-        status: state.status,
-        posterUrl: state.posterUrl,
-        tracks: state.tracks.map((t) => ({
-          id: t.id,
-          status: t.status,
-          audioUrl: t.audioUrl,
-        })),
-        lyrics: state.tracks.map((t) => t.lyrics).filter(Boolean).join("\n\n---\n\n"),
-      });
-    }
+// ─── Legacy poll handler ──────────────────────────────────────────────────────
 
-    // Dev mode: just return current state (timeouts in generate handle updates)
-    if (DEV_MODE) {
-      const allCompleted = state.tracks.every((t) => t.status === "completed");
-      if (allCompleted) state.status = "completed";
-      global.generationStore.set(generationId, state);
+async function handleLegacyPoll(generationId: string) {
+  const state = getLegacyStore()?.get(generationId);
 
-      return NextResponse.json({
-        id: state.id,
-        status: state.status,
-        posterUrl: state.posterUrl,
-        tracks: state.tracks.map((t) => ({
-          id: t.id,
-          status: t.status,
-          audioUrl: t.audioUrl,
-        })),
-        lyrics: state.tracks.map((t) => t.lyrics).filter(Boolean).join("\n\n---\n\n"),
-      });
-    }
+  if (!state) {
+    return NextResponse.json({ error: "Generation not found" }, { status: 404 });
+  }
 
-    // Poll ACE for each track still processing
-    const updatedTracks = await Promise.all(
-      state.tracks.map(async (track) => {
-        if (track.status === "completed" || track.status === "failed" || !track.aceTaskId) {
-          return track;
-        }
+  if (state.status === "completed" || state.status === "failed") {
+    return NextResponse.json({
+      id: state.id,
+      status: state.status,
+      posterUrl: state.posterUrl,
+      tracks: state.tracks.map((t) => ({
+        id: t.id,
+        status: t.status,
+        audioUrl: t.audioUrl,
+      })),
+      lyrics: state.tracks
+        .map((t) => t.lyrics)
+        .filter(Boolean)
+        .join("\n\n---\n\n"),
+    });
+  }
 
-        try {
-          // Step 1: Check status
-          const statusRes = await fetch(`${ACE_STATUS_URL}/${track.aceTaskId}`, {
-            headers: { Authorization: `Bearer ${ACE_API_KEY}` },
-          });
-
-          if (!statusRes.ok) {
-            console.error(`ACE status failed for ${track.aceTaskId}: ${statusRes.status}`);
-            return track;
-          }
-
-          const statusData = await statusRes.json();
-          console.log(`ACE [${track.id}] status: ${statusData.status}`);
-
-          if (statusData.status === "completed") {
-            // Step 2: Fetch result from /result endpoint
-            const resultRes = await fetch(`${ACE_STATUS_URL}/${track.aceTaskId}/result`, {
-              headers: { Authorization: `Bearer ${ACE_API_KEY}` },
-            });
-
-            if (!resultRes.ok) {
-              const errText = await resultRes.text();
-              console.error(`ACE result failed for ${track.aceTaskId}: ${resultRes.status}`, errText);
-              // Still mark as completed even if result fetch fails
-              return { ...track, status: "completed" as const };
-            }
-
-            const resultData = await resultRes.json();
-            console.log(`ACE [${track.id}] result:`, JSON.stringify(resultData).slice(0, 500));
-
-            // Per docs: webhook format has "outputs": ["<output_url>"]
-            // The /result endpoint likely returns similar
-            let audioUrl: string | null = null;
-
-            if (resultData.outputs && Array.isArray(resultData.outputs) && resultData.outputs.length > 0) {
-              audioUrl = resultData.outputs[0];
-            } else if (resultData.output && typeof resultData.output === "string") {
-              audioUrl = resultData.output;
-            } else if (resultData.output?.url) {
-              audioUrl = resultData.output.url;
-            } else if (resultData.output?.audio_url) {
-              audioUrl = resultData.output.audio_url;
-            } else if (resultData.url) {
-              audioUrl = resultData.url;
-            } else if (resultData.audio_url) {
-              audioUrl = resultData.audio_url;
-            }
-
-            console.log(`Track ${track.id} completed. Audio: ${audioUrl}`);
-
-            return {
-              ...track,
-              status: "completed" as const,
-              audioUrl,
-            };
-          } else if (statusData.status === "failed") {
-            console.error(`Track ${track.id} failed:`, statusData.error || "unknown");
-            return { ...track, status: "failed" as const };
-          }
-
-          // pending / processing
-          return { ...track, status: "processing" as const };
-        } catch (err) {
-          console.error(`Error polling ACE for ${track.aceTaskId}:`, err);
-          return track;
-        }
-      })
-    );
-
-    state.tracks = updatedTracks;
-
-    const allCompleted = updatedTracks.every((t) => t.status === "completed");
-    const anyFailed = updatedTracks.some((t) => t.status === "failed");
-    const allDone = updatedTracks.every((t) => t.status === "completed" || t.status === "failed");
-
-    if (allCompleted) {
-      state.status = "completed";
-    } else if (allDone && anyFailed) {
-      state.status = "failed";
-    }
-
-    global.generationStore.set(generationId, state);
+  if (DEV_MODE) {
+    const allCompleted = state.tracks.every((t) => t.status === "completed");
+    if (allCompleted) state.status = "completed";
+    // state is a reference; Map reflects mutations automatically
 
     return NextResponse.json({
       id: state.id,
@@ -152,10 +197,87 @@ export async function GET(request: NextRequest) {
         status: t.status,
         audioUrl: t.audioUrl,
       })),
-      lyrics: state.tracks.map((t) => t.lyrics).filter(Boolean).join("\n\n---\n\n"),
+      lyrics: state.tracks
+        .map((t) => t.lyrics)
+        .filter(Boolean)
+        .join("\n\n---\n\n"),
     });
-  } catch (error) {
-    console.error("Status check error:", error);
-    return NextResponse.json({ error: "Failed to check status" }, { status: 500 });
   }
+
+  // Poll ACE for each pending track
+  const updatedTracks = await Promise.all(
+    state.tracks.map(async (track) => {
+      if (
+        track.status === "completed" ||
+        track.status === "failed" ||
+        !track.aceTaskId
+      ) {
+        return track;
+      }
+
+      try {
+        const statusRes = await fetch(
+          `${ACE_STATUS_URL}/${track.aceTaskId}`,
+          { headers: { Authorization: `Bearer ${ACE_API_KEY}` } }
+        );
+        if (!statusRes.ok) return track;
+
+        const statusData = await statusRes.json();
+
+        if (statusData.status === "completed") {
+          const resultRes = await fetch(
+            `${ACE_STATUS_URL}/${track.aceTaskId}/result`,
+            { headers: { Authorization: `Bearer ${ACE_API_KEY}` } }
+          );
+          let audioUrl: string | null = null;
+          if (resultRes.ok) {
+            const rd = await resultRes.json();
+            audioUrl =
+              rd.outputs?.[0] ??
+              rd.output?.url ??
+              rd.output?.audio_url ??
+              (typeof rd.output === "string" ? rd.output : null) ??
+              rd.audio_url ??
+              rd.url ??
+              null;
+          }
+          return { ...track, status: "completed", audioUrl };
+        }
+
+        if (statusData.status === "failed") {
+          return { ...track, status: "failed" };
+        }
+
+        return { ...track, status: "processing" };
+      } catch {
+        return track;
+      }
+    })
+  );
+
+  state.tracks = updatedTracks as typeof state.tracks;
+
+  const allCompleted = updatedTracks.every((t) => t.status === "completed");
+  const allDone = updatedTracks.every(
+    (t) => t.status === "completed" || t.status === "failed"
+  );
+
+  if (allCompleted) state.status = "completed";
+  else if (allDone) state.status = "failed";
+  // state is a reference — Map reflects mutations automatically
+
+  return NextResponse.json({
+    id: state.id,
+    status: state.status,
+    posterUrl: state.posterUrl,
+    tracks: state.tracks.map((t) => ({
+      id: t.id,
+      status: t.status,
+      audioUrl: t.audioUrl,
+    })),
+    lyrics: state.tracks
+      .map((t) => t.lyrics)
+      .filter(Boolean)
+      .join("\n\n---\n\n"),
+  });
 }
